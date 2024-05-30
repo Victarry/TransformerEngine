@@ -106,7 +106,14 @@ class _Linear(torch.autograd.Function):
         )
 
         tp_world_size = get_distributed_world_size(tp_group)
-        ub_overlap_rs = False if tp_world_size == 1 else ub_overlap_rs
+        if tp_world_size == 1 or parallel_mode == None:
+            ub_overlap_rs = False
+            ub_overlap_ag = False
+
+
+        # overlap flag for forward
+        ub_overlap_ag = (parallel_mode == "column") and ub_overlap_ag
+        ub_overlap_rs = (parallel_mode == "row") and ub_overlap_rs
 
         # Cast input to expected dtype
         inputmat = cast_if_needed(inputmat, activation_dtype)
@@ -148,7 +155,12 @@ class _Linear(torch.autograd.Function):
                     )
 
         # Column Parallel Linear
-        if parallel_mode == "column" and sequence_parallel:
+        if ub_overlap_ag:
+            ub_obj_input = get_ub(ub_name+"_fprop")
+            # Explicit copy input or pass extra output in gemm
+            ub_obj_input.copy_input_to_ubuf(inputmat, True)
+            inputmat_total = ub_obj_input.get_ubuf_output(1)
+        elif parallel_mode == "column" and sequence_parallel:
             inputmat_total, _ = gather_along_first_dim(inputmat, tp_group)
         else:
             inputmat_total = inputmat
@@ -294,23 +306,50 @@ class _Linear(torch.autograd.Function):
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
                 else:
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS
+            elif ub_overlap_ag:
+                if ub_obj_input.is_p2p_overlap():
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
+                else:
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
-            _ = gemm(
-                weight,
-                inputmat_total,
-                activation_dtype,
-                get_workspace(),
-                bias=bias,
-                use_bias=use_bias,
-                out=out,
-                ub_algo=ub_algo if ub_overlap_rs else None,
-                ub=ub_obj_projout if ub_overlap_rs else None,
-                extra_output_tensor=rs_out if ub_overlap_rs else None,
-            )
+            if ub_overlap_rs:
+                _ = gemm(
+                    weight,
+                    inputmat_total,
+                    activation_dtype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    out=out,
+                    ub_algo=ub_algo,
+                    ub=ub_obj_projout,
+                    extra_output_tensor=rs_out,
+                )
+            elif ub_overlap_ag:
+                out, _, _ = gemm(
+                    weight,
+                    inputmat_total,
+                    activation_dtype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    ub_algo=ub_algo,
+                    ub=ub_obj_input,
+                )
+            else:
+                _ = gemm(
+                    weight,
+                    inputmat_total,
+                    activation_dtype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    out=out,
+                )
 
         if is_grad_enabled:
             saved_inputmat = None
@@ -357,7 +396,7 @@ class _Linear(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.parallel_mode = parallel_mode
             ctx.tp_group = tp_group
-            ctx.ub_overlap_ag = ub_overlap_ag
+            ctx.ub_overlap_ag = ub_overlap_ag and parallel_mode == "row"
             ctx.ub_name = ub_name
             ctx.tp_size = tp_size
             ctx.requires_dgrad = inp.requires_grad
@@ -414,7 +453,6 @@ class _Linear(torch.autograd.Function):
                 weight_t_fp8 = weight_t_fp8._data
 
             tp_world_size = get_distributed_world_size(ctx.tp_group)
-            ctx.ub_overlap_ag = False if tp_world_size == 1 else ctx.ub_overlap_ag
             if ctx.ub_overlap_ag:
                 dim_size = list(grad_output.size())
                 dim_size[0] = dim_size[0] * tp_world_size
