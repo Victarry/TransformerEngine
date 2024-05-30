@@ -111,7 +111,8 @@ class _Linear(torch.autograd.Function):
             ub_overlap_ag = False
 
 
-        # overlap flag for forward
+        ub_overlap_ag_dgrad = (parallel_mode == "row") and ub_overlap_ag
+        
         ub_overlap_ag = (parallel_mode == "column") and ub_overlap_ag
         ub_overlap_rs = (parallel_mode == "row") and ub_overlap_rs
 
@@ -396,7 +397,7 @@ class _Linear(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.parallel_mode = parallel_mode
             ctx.tp_group = tp_group
-            ctx.ub_overlap_ag = ub_overlap_ag and parallel_mode == "row"
+            ctx.ub_overlap_ag = ub_overlap_ag_dgrad
             ctx.ub_name = ub_name
             ctx.tp_size = tp_size
             ctx.requires_dgrad = inp.requires_grad
