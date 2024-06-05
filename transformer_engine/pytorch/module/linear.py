@@ -242,34 +242,85 @@ class _Linear(torch.autograd.Function):
                     proj_out_tetype = fp8_dtype_forward
                     proj_out_pttype = torch.uint8
                     ub_obj_projout.set_ubuf_scale_inv(meta_tensor.scale_inv[proj_out_index])
+                _ = fp8_gemm(
+                    weight_fp8._data,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    fp8_dtype_forward,
+                    inputmat_total._data
+                    if isinstance(inputmat_total, Float8Tensor) else inputmat_total,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_INPUT,
+                    fp8_dtype_forward,
+                    proj_out_pttype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    use_split_accumulator=_2X_ACC_FPROP,
+                    out=out,
+                    ub_algo=ub_algo ,
+                    ub=ub_obj_projout ,
+                    extra_output_tensor=rs_out,
+                    out_index=proj_out_index,
+                    fp8_meta_tensor = meta_tensor,
+                    D_dtype = proj_out_tetype,
+                )
+            elif ub_overlap_ag:
+                if ub_obj_input.is_p2p_overlap():
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
+                else:
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
+                _ = fp8_gemm(
+                    weight_fp8._data,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    fp8_dtype_forward,
+                    inputmat_total._data
+                    if isinstance(inputmat_total, Float8Tensor) else inputmat_total,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_INPUT,
+                    fp8_dtype_forward,
+                    proj_out_pttype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    use_split_accumulator=_2X_ACC_FPROP,
+                    out=out,
+                    ub_algo=ub_algo,
+                    ub=ub_obj_input,
+                    extra_output_tensor=None,
+                    out_index=proj_out_index,
+                    fp8_meta_tensor = meta_tensor,
+                    D_dtype = proj_out_tetype,
+                ) 
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)
                 out = torch.empty(dim_size, dtype=proj_out_pttype, device=inputmat_total.device)
+                _ = fp8_gemm(
+                    weight_fp8._data,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    fp8_dtype_forward,
+                    inputmat_total._data
+                    if isinstance(inputmat_total, Float8Tensor) else inputmat_total,
+                    fp8_meta["scaling_fwd"].scale_inv,
+                    tex.FP8FwdTensors.GEMM1_INPUT,
+                    fp8_dtype_forward,
+                    proj_out_pttype,
+                    get_workspace(),
+                    bias=bias,
+                    use_bias=use_bias,
+                    use_split_accumulator=_2X_ACC_FPROP,
+                    out=out,
+                    ub_algo=None,
+                    ub=None,
+                    extra_output_tensor=None,
+                    out_index=proj_out_index,
+                    fp8_meta_tensor = meta_tensor,
+                    D_dtype = proj_out_tetype,
+                )
 
-            _ = fp8_gemm(
-                weight_fp8._data,
-                fp8_meta["scaling_fwd"].scale_inv,
-                tex.FP8FwdTensors.GEMM1_WEIGHT,
-                fp8_dtype_forward,
-                inputmat_total._data
-                if isinstance(inputmat_total, Float8Tensor) else inputmat_total,
-                fp8_meta["scaling_fwd"].scale_inv,
-                tex.FP8FwdTensors.GEMM1_INPUT,
-                fp8_dtype_forward,
-                proj_out_pttype,
-                get_workspace(),
-                bias=bias,
-                use_bias=use_bias,
-                use_split_accumulator=_2X_ACC_FPROP,
-                out=out,
-                ub_algo=ub_algo if ub_overlap_rs else None,
-                ub=ub_obj_projout if ub_overlap_rs else None,
-                extra_output_tensor=rs_out if ub_overlap_rs else None,
-                out_index=proj_out_index,
-                fp8_meta_tensor = meta_tensor,
-                D_dtype = proj_out_tetype,
-            )
             if is_first_module_in_mha:
                 out = Float8Tensor(data=out,
                     fp8_meta=fp8_meta,
