@@ -270,6 +270,9 @@ class _Linear(torch.autograd.Function):
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
                 else:
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
+                dim_size = list(inputmat_total.size())
+                dim_size[1] = weight.size(0)
+                out = torch.empty(dim_size, dtype=proj_out_pttype, device=inputmat_total.device)
                 _ = fp8_gemm(
                     weight_fp8._data,
                     fp8_meta["scaling_fwd"].scale_inv,
