@@ -188,17 +188,32 @@ def _compute_grad_params(
                             zero=getattr(wp, "zero_out_wgrad", False),
                         )
 
-    # Assemble grad_params in parameter registration order.
-    if not fc_op.has_bias:
-        return w_list
-
-    if fc_op.single_grouped_bias:
-        return w_list + [bias_grad_packed]
-
-    bias_list = bias_grads if bias_grads is not None else [None] * num_groups
+    # Assemble grad_params in _parameters registration order. The fuser captured
+    # num_params from ``list(op.parameters())`` at forward time, so the returned
+    # list must align with that exact set of (non-None) Parameters. ECHO's
+    # ``free_expert_parameters`` may have popped some weight{i} entries from
+    # ``_parameters``; iterating ``_parameters`` here skips them naturally and
+    # keeps the shape-based ordering the original branches encoded.
+    grads_by_name: dict[str, object] = {}
     if fc_op.single_grouped_weight:
-        return bias_list + w_list
-    return w_list + bias_list
+        grads_by_name["weight"] = w_list[0]
+    else:
+        for idx in range(num_groups):
+            grads_by_name[f"weight{idx}"] = w_list[idx]
+
+    if fc_op.has_bias:
+        if fc_op.single_grouped_bias:
+            grads_by_name["bias"] = bias_grad_packed
+        else:
+            bl = bias_grads if bias_grads is not None else [None] * num_groups
+            for idx in range(num_groups):
+                grads_by_name[f"bias{idx}"] = bl[idx]
+
+    return [
+        grads_by_name[name]
+        for name, param in fc_op._parameters.items()
+        if param is not None and name in grads_by_name
+    ]
 
 
 class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
