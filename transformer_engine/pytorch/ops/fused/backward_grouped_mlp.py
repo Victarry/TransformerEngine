@@ -116,11 +116,32 @@ def _compute_grad_params(
         w_list = [None] * num_groups
         if ctx.weight_requires_grad:
             if fc_op._accumulate_into_main_grad:
+                # ECHO "elastic cloning" injects cloned expert weights onto the
+                # fused op via setattr as plain tensors (not nn.Parameters), so
+                # they lack main_grad. Resolve per-index: route wgrad for
+                # DistOpt-registered weights into their main_grad buffer, and
+                # for cloned weights allocate a fresh zero buffer. The fresh
+                # buffer then flows back as the real grad via autograd so the
+                # dispatch op's backward can reduce it into the home expert's
+                # main_grad on the source rank.
+                wgrad_dtype = None
                 for idx in range(num_groups):
                     wp = getattr(fc_op, f"weight{idx}")
                     if hasattr(wp, "__fsdp_param__"):
                         wp.main_grad = wp.get_main_grad()
-                    w_list[idx] = wp.main_grad
+                    if hasattr(wp, "main_grad"):
+                        wgrad_dtype = wp.main_grad.dtype
+                        break
+                if wgrad_dtype is None:
+                    wgrad_dtype = torch.float32
+                for idx in range(num_groups):
+                    wp = getattr(fc_op, f"weight{idx}")
+                    if hasattr(wp, "main_grad"):
+                        w_list[idx] = wp.main_grad
+                    else:
+                        w_list[idx] = torch.zeros(
+                            weight_shape, dtype=wgrad_dtype, device=device
+                        )
                 accumulate_into_main_grad = not getattr(fc_op.weight0, "overwrite_main_grad", False)
             else:
                 for idx in range(num_groups):
