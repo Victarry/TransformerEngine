@@ -114,35 +114,46 @@ def _compute_grad_params(
             wgrad_output = grouped_wgrad
     else:
         w_list = [None] * num_groups
+        echo_fresh_buf_indices: list[int] = []
         if ctx.weight_requires_grad:
             if fc_op._accumulate_into_main_grad:
-                # ECHO "elastic cloning" injects cloned expert weights onto the
-                # fused op via setattr as plain tensors (not nn.Parameters), so
-                # they lack main_grad. Resolve per-index: route wgrad for
-                # DistOpt-registered weights into their main_grad buffer, and
-                # for cloned weights allocate a fresh zero buffer. The fresh
-                # buffer then flows back as the real grad via autograd so the
-                # dispatch op's backward can reduce it into the home expert's
-                # main_grad on the source rank.
+                # Detect ECHO clones (plain tensors set via setattr, no main_grad).
+                # When any cloned weight is present, the grouped wgrad GEMM kernel
+                # cannot mix DistOpt main_grad views with freshly-allocated buffers
+                # (the kernel's pointer-setup asserted in launch_grouped_gemm_setup
+                # when this was tried). Instead, we allocate fresh FP32 zero
+                # buffers for *every* group, run the GEMM with accumulate=False,
+                # then fold each home expert's contribution into main_grad after
+                # the GEMM; the dispatched buffers flow back through autograd to
+                # HybridEPExpertDispatch.backward, as before.
+                echo_clone_present = False
                 wgrad_dtype = None
                 for idx in range(num_groups):
                     wp = getattr(fc_op, f"weight{idx}")
                     if hasattr(wp, "__fsdp_param__"):
                         wp.main_grad = wp.get_main_grad()
                     if hasattr(wp, "main_grad"):
-                        wgrad_dtype = wp.main_grad.dtype
-                        break
+                        if wgrad_dtype is None:
+                            wgrad_dtype = wp.main_grad.dtype
+                    else:
+                        echo_clone_present = True
                 if wgrad_dtype is None:
                     wgrad_dtype = torch.float32
-                for idx in range(num_groups):
-                    wp = getattr(fc_op, f"weight{idx}")
-                    if hasattr(wp, "main_grad"):
-                        w_list[idx] = wp.main_grad
-                    else:
+
+                if echo_clone_present:
+                    for idx in range(num_groups):
                         w_list[idx] = torch.zeros(
                             weight_shape, dtype=wgrad_dtype, device=device
                         )
-                accumulate_into_main_grad = not getattr(fc_op.weight0, "overwrite_main_grad", False)
+                        echo_fresh_buf_indices.append(idx)
+                    accumulate_into_main_grad = False
+                else:
+                    for idx in range(num_groups):
+                        wp = getattr(fc_op, f"weight{idx}")
+                        w_list[idx] = wp.main_grad
+                    accumulate_into_main_grad = not getattr(
+                        fc_op.weight0, "overwrite_main_grad", False
+                    )
             else:
                 for idx in range(num_groups):
                     w_list[idx] = torch.empty(weight_shape, dtype=dtype, device=device)
@@ -182,6 +193,23 @@ def _compute_grad_params(
                     wp = getattr(fc_op, f"weight{idx}")
                     if hasattr(wp, "grad_added_to_main_grad"):
                         wp.grad_added_to_main_grad = True
+                        w_list[idx] = get_dummy_wgrad(
+                            list(wp.size()),
+                            wp.dtype,
+                            zero=getattr(wp, "zero_out_wgrad", False),
+                        )
+            elif echo_fresh_buf_indices and not delay_wgrad:
+                # ECHO overwrite path: fold each home expert's fresh-buf wgrad
+                # into its main_grad and replace the slot with a dummy so
+                # autograd/DDP hooks do not double-accumulate. Dispatched
+                # clones keep the fresh buffer so HybridEPExpertDispatch.backward
+                # receives the real gradient through autograd.
+                for idx in echo_fresh_buf_indices:
+                    wp = getattr(fc_op, f"weight{idx}")
+                    if hasattr(wp, "main_grad"):
+                        wp.main_grad.add_(w_list[idx])
+                        if hasattr(wp, "grad_added_to_main_grad"):
+                            wp.grad_added_to_main_grad = True
                         w_list[idx] = get_dummy_wgrad(
                             list(wp.size()),
                             wp.dtype,
